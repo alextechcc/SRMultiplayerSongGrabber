@@ -53,7 +53,7 @@ namespace SRMultiplayerSongGrabber
             SetupDownloadButton();
         }
 
-        public void OnOpenMultiplayerRoomMenu(Il2CppSynth.Versus.Room room)
+        public void OnOpenMultiplayerRoomMenu()
         {
             Logger.Msg("OpenMultiRoom");
             SetupDownloadButton();

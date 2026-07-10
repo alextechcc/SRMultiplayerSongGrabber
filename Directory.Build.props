@@ -1,0 +1,8 @@
+<Project>
+  <!-- The Il2CppInterop proxies for Synth Riders 3.6.3+ (Unity 6) break Roslyn's
+       lookup of the compiler-required nullable attributes (CS0656), so compile an
+       in-source definition into every project, including submodules. -->
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)NullableAttributeShim.cs" Visible="false" />
+  </ItemGroup>
+</Project>

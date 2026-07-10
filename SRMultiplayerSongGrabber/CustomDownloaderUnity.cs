@@ -164,10 +164,10 @@ namespace SRMultiplayerSongGrabber
             // Try to create folder structure if it doesn't exist yet
             Directory.CreateDirectory(customsPath);
 
-            songRequest.downloadHandler = new DownloadHandlerFile(customsPath + "dump.synth", false);
-            
+            // Unity 6 builds of the game strip DownloadHandlerFile's constructors,
+            // so download to the default buffer and write the file ourselves.
             yield return songRequest.SendWebRequest();
-            
+
             if (songRequest.isNetworkError)
             {
                 logger.Error("GetSong error: " + songRequest.error);
@@ -176,7 +176,8 @@ namespace SRMultiplayerSongGrabber
             else
             {
                 logger.Msg("Download successful");
-                
+                File.WriteAllBytes(customsPath + "dump.synth", songRequest.downloadHandler.data);
+
                 //rename file
                 if (File.Exists(customsPath + "dump.synth"))
                 {
