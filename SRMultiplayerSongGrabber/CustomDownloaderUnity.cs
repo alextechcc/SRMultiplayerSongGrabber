@@ -34,6 +34,18 @@ namespace SRMultiplayerSongGrabber
         /// <returns></returns>
         public static IEnumerator TryGetSongWithHash(SRLogger logger, string hash, Action onSuccess, Action onFail)
         {
+            // Resolve the map's file name up front. The Unity 6 game build broke reading
+            // response headers (stripped span helpers), so content-disposition is unusable.
+            MapItem? mapInfo = null;
+            yield return GetSongInfoFromHash(logger, hash, mapItem => mapInfo = mapItem, null);
+
+            var fileName = mapInfo?.filename;
+            if (string.IsNullOrEmpty(fileName))
+            {
+                fileName = hash + ".synth";
+                logger.Msg($"No filename from map info; falling back to '{fileName}'");
+            }
+
             string downloadUrlZ = apiRootZ + "/beatmaps/hash/download/" + hash;
 
             var isSuccess = false;
@@ -49,7 +61,7 @@ namespace SRMultiplayerSongGrabber
                 // Don't trigger fail case yet; fallback still to come
             }
 
-            yield return GetSongWithHash(logger, downloadUrlZ, OnSuccessZ, OnFailZ);
+            yield return GetSongWithHash(logger, downloadUrlZ, fileName, OnSuccessZ, OnFailZ);
 
             // If it worked; we done!
             if (isSuccess)
@@ -72,43 +84,46 @@ namespace SRMultiplayerSongGrabber
                 // Don't trigger fail case yet; can still try another fallback
             }
 
-            yield return GetSongWithHash(logger, downloadUrlSyn, OnSuccessSyn, OnFailSyn);
+            yield return GetSongWithHash(logger, downloadUrlSyn, fileName, OnSuccessSyn, OnFailSyn);
 
             // If it worked; we done!
             if (isSuccessSyn)
                 yield break;
 
             // Synplicity download failed; fallback on torrent I guess
+            if (string.IsNullOrEmpty(mapInfo?.filename))
+            {
+                logger.Error("No map info available; cannot fall back to torrent download");
+                onFail?.Invoke();
+                yield break;
+            }
+
             if (_repoTorrent == null)
             {
                 _repoTorrent = new CustomMapRepoTorrent(new SRTimestampLib.SRLogHandler());
                 yield return _repoTorrent.Initialize();
             }
 
-            // Get file info from the hash, so we get the file name
-            yield return GetSongInfoFromHash(logger, hash, async (mapItem) =>
+            var downloadTask = _repoTorrent.DownloadMapFromFilename(mapInfo.filename);
+            while (!downloadTask.IsCompleted)
+                yield return null;
+
+            if (downloadTask.IsFaulted || string.IsNullOrEmpty(downloadTask.Result))
             {
-                var fileName = mapItem.filename;
-                if (string.IsNullOrEmpty(fileName))
-                {
-                    logger.Error($"Null or empty filename! '{fileName}'");
-                    onFail?.Invoke();
-                    return;
-                }
-                var downloadedPath = await _repoTorrent.DownloadMapFromFilename(fileName);
-                if (string.IsNullOrEmpty(downloadedPath))
-                {
-                    logger.Error($"Failed to download {fileName}");
-                    onFail?.Invoke();
-                    return;
-                }
-            }, onFail);
+                logger.Error($"Failed to download {mapInfo.filename}" +
+                    (downloadTask.IsFaulted ? $": {downloadTask.Exception?.GetBaseException().Message}" : ""));
+                onFail?.Invoke();
+                yield break;
+            }
+
+            SongSelectionManager.GetInstance.RefreshSongList(false);
+            onSuccess?.Invoke();
         }
 
-        public static IEnumerator GetSongInfoFromHash(SRLogger logger, string hash, Action<MapItem> onSuccess, Action onFail)
+        public static IEnumerator GetSongInfoFromHash(SRLogger logger, string hash, Action<MapItem> onSuccess, Action? onFail)
         {
-            // Get from synplicity, since that also gets it from Z
-            var url = apiRootSyn + "/beatmaps/" + hash;
+            // Query Z directly (synplicity.live is gone)
+            var url = "https://" + apiRootZ + "/beatmaps?s=" + Uri.EscapeDataString("{\"hash\":\"" + hash + "\"}");
             var request = UnityWebRequest.Get(url);
 
             // Don't hang forever if the site happens to be down
@@ -124,7 +139,17 @@ namespace SRMultiplayerSongGrabber
             }
 
             // Try to parse
-            MapItem? mapItem = JsonSerializer.Deserialize<MapItem>(request.downloadHandler.text, options: new JsonSerializerOptions());
+            MapItem? mapItem = null;
+            try
+            {
+                var page = JsonSerializer.Deserialize<BeatmapPageZ>(request.downloadHandler.text, options: new JsonSerializerOptions());
+                mapItem = page?.data?.FirstOrDefault();
+            }
+            catch (Exception ex)
+            {
+                logger.Error("Failed to parse map info: " + ex.Message);
+            }
+
             if (mapItem == null)
             {
                 logger.Error("Failed to parse map info!");
@@ -136,12 +161,20 @@ namespace SRMultiplayerSongGrabber
         }
 
         /// <summary>
+        /// Shape of Z's paginated /api/beatmaps response
+        /// </summary>
+        public class BeatmapPageZ
+        {
+            public MapItem[]? data { get; set; }
+        }
+
+        /// <summary>
         /// Downloads the given song from the Z site to the CustomSongs folder
         /// </summary>
         /// <param name="logger"></param>
         /// <param name="url"></param>
         /// <returns></returns>
-        private static IEnumerator GetSongWithHash(SRLogger logger, string url, Action onSuccess, Action onFail)
+        private static IEnumerator GetSongWithHash(SRLogger logger, string url, string fileName, Action onSuccess, Action onFail)
         {
             var ssmInstance = SongSelectionManager.GetInstance;
 
@@ -164,34 +197,21 @@ namespace SRMultiplayerSongGrabber
             // Try to create folder structure if it doesn't exist yet
             Directory.CreateDirectory(customsPath);
 
-            // Unity 6 builds of the game strip DownloadHandlerFile's constructors,
-            // so download to the default buffer and write the file ourselves.
+            // Unity 6 builds of the game strip DownloadHandlerFile's constructors and
+            // break GetResponseHeader, so download to the default buffer and write the
+            // file ourselves under the name resolved from the map info.
             yield return songRequest.SendWebRequest();
 
-            if (songRequest.isNetworkError)
+            if (songRequest.isNetworkError || songRequest.isHttpError)
             {
                 logger.Error("GetSong error: " + songRequest.error);
                 onFail?.Invoke();
             }
             else
             {
-                logger.Msg("Download successful");
-                File.WriteAllBytes(customsPath + "dump.synth", songRequest.downloadHandler.data);
-
-                //rename file
-                if (File.Exists(customsPath + "dump.synth"))
-                {
-                    var contentDisposition = songRequest.GetResponseHeader("content-disposition").Split('"');
-                    foreach (var elem in contentDisposition)
-                    {
-                        logger.Msg("content-disposition element is " + elem);
-                    }
-                    string fileName = contentDisposition[1];
-                    logger.Msg("Using file name " + fileName);
-                    File.Move(customsPath + "dump.synth", customsPath + fileName);
-
-                    // TODO update file timestamp?
-                }
+                var destPath = Path.Combine(customsPath, fileName);
+                File.WriteAllBytes(destPath, songRequest.downloadHandler.data);
+                logger.Msg("Downloaded to " + destPath);
 
                 // Force reload
                 ssmInstance.RefreshSongList(false);
